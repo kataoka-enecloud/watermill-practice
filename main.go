@@ -1,13 +1,13 @@
-// Command watermill-practice is a self-contained demonstration of the
-// [Transactional Outbox pattern] applied with Watermill: aggregate →
-// event store → outbox → forwarder → NATS → projection → read model → HTTP.
+// Command watermill-practice は [Transactional Outbox pattern] を Watermill で実装した
+// 自己完結型のデモだ。aggregate → event store → outbox → forwarder → NATS →
+// projection → read model → HTTP という一連の流れを 1 ファイルで示す。
 //
-// Run:
+// 起動:
 //
 //	docker compose up -d         # postgres :5432 + nats :4222
 //	go run .                      # HTTP server on :8080
 //
-// Drive it:
+// 動かし方:
 //
 //	curl -X POST localhost:8080/counters/c1/increment -d '{"delta":5}'
 //	# → {"counter_id":"c1","version":1}
@@ -18,29 +18,23 @@
 //	curl 'localhost:8080/counters/c1?after=2'
 //	# → {"counter_id":"c1","value":8,"version":2}
 //
-// The ?after=N parameter is a read-your-writes ticket (see [Werner Vogels
-// on read-your-writes]): the GET blocks until counter_view.last_event_seq
-// reaches at least N, so a client that just saw version 2 from a POST can
-// ask the projection to catch up before replying (up to a 5-second budget).
+// ?after=N を指定すると、counter_view.last_event_seq が N 以上になるまで
+// GET がブロックする（最大 5 秒）。自分が POST で作ったバージョンを
+// 確実に読み返すための read-your-writes 動作だ（[Werner Vogels on read-your-writes] 参照）。
 //
-// The eight numbered sections of this file:
+// このファイルの 8 つのセクション:
 //
-//  1. Event store + read model DDL.
-//  2. Counter aggregate.
-//  3. app struct + (*app).newTxEventBus — the three-layer publisher
-//     chain ([sql.TxFromPgx] → [forwarder] → [Watermill CQRS docs]).
-//  4. (*app).incrementCounter — one pgx transaction: load, execute,
-//     appendToStream, publish, commit.
-//  5. (*app).runForwarder — outbox drainer, BeginnerFromPgx +
-//     InitializeSchema.
-//  6. ensureStream — manual JetStream stream bootstrap (watermill-nats
-//     does not create streams for you).
-//  7. (*app).runProjection — cqrs.EventGroupProcessor + onIncremented.
-//  8. (*app).incrementHandler / showHandler — Echo handlers and the
-//     read-your-writes poll.
+//  1. Event store + read model DDL。
+//  2. Counter aggregate。
+//  3. app struct + (*app).newTxEventBus — 3 層の publisher チェーン
+//     （[sql.TxFromPgx] → [forwarder] → [Watermill CQRS docs]）。
+//  4. (*app).incrementCounter — 1 つの pgx transaction で load・append・publish・commit。
+//  5. (*app).runForwarder — outbox drainer。BeginnerFromPgx + InitializeSchema。
+//  6. ensureStream — JetStream stream の手動 bootstrap。
+//  7. (*app).runProjection — cqrs.EventGroupProcessor + onIncremented。
+//  8. (*app).incrementHandler / showHandler — Echo handlers と read-your-writes poll。
 //
-// See watermill-cookbook.md next to this file for prose commentary on
-// each recipe and the gotchas each one protects against.
+// 各レシピの詳細と gotcha は隣の watermill-cookbook.md を参照。
 //
 // [Transactional Outbox pattern]: https://microservices.io/patterns/data/transactional-outbox.html
 // [Werner Vogels on read-your-writes]: https://www.allthingsdistributed.com/2008/12/eventually_consistent.html
@@ -62,8 +56,8 @@ import (
 	"syscall"
 	"time"
 
-	// watermill core + adapters. wmjs / wsql wrap the underlying
-	// brokers in watermill's Publisher/Subscriber interface.
+	// watermill コアとアダプタ。wmjs / wsql は各ブローカーを
+	// watermill の Publisher/Subscriber interface でラップする。
 	"github.com/ThreeDotsLabs/watermill"
 	wmjs "github.com/ThreeDotsLabs/watermill-nats/v2/pkg/jetstream"
 	wsql "github.com/ThreeDotsLabs/watermill-sql/v4/pkg/sql"
@@ -71,9 +65,8 @@ import (
 	"github.com/ThreeDotsLabs/watermill/components/forwarder"
 	"github.com/ThreeDotsLabs/watermill/message"
 
-	// raw drivers. jetsdk is the official NATS SDK's JetStream
-	// subpackage, used directly (not via watermill) to bootstrap the
-	// stream in ensureStream.
+	// 生ドライバ。jetsdk は公式 NATS SDK の JetStream サブパッケージで、
+	// ensureStream での stream bootstrap に直接使う。
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -85,8 +78,9 @@ import (
 // ======================================================================
 // 1. Event store + read model DDL
 //
-// CREATE IF NOT EXISTS makes this idempotent against a fresh
-// docker-compose DB or one that already has the schema.
+// CREATE IF NOT EXISTS により、初回起動でも再起動でも idempotent に動く。
+// watermill_outbox / watermill_offsets_outbox はここに書かない。
+// それらは section 5 の subscriber が bootstrap する。
 // ======================================================================
 
 const schemaDDL = `
@@ -111,10 +105,8 @@ CREATE TABLE IF NOT EXISTS counter_view (
 // ======================================================================
 // 2. Counter aggregate
 //
-// Counter is the aggregate, Incremented is its only event. Increment is
-// the command (returns an event), Apply folds an event into state.
-// time.Now / uuid.New are called inline — this is a demo, not a place
-// to hide a Clock port behind an interface.
+// Counter が aggregate、Incremented が唯一のイベント。
+// Increment はコマンド（イベントを返す）、Apply はイベントを状態に畳み込む。
 // ======================================================================
 
 type Counter struct {
@@ -147,28 +139,20 @@ func (c *Counter) Increment(delta int64) *Incremented {
 }
 
 // ======================================================================
-// 3. app struct + the three-layer outbox publisher chain
+// 3. app struct + 3 層の outbox publisher チェーン
 //
-// app holds the per-process dependencies that every domain method,
-// every projection handler, and every HTTP handler needs. Hanging
-// methods off this struct keeps signatures short and stops the
-// dependencies from leaking across requests.
+// app はプロセス全体で共有する依存をまとめる struct だ。
+// method としてぶら下げることでシグネチャを短く保つ。
 //
-// newTxEventBus is the core recipe. sql.NewPublisher(sql.TxFromPgx(tx))
-// binds the watermill publisher to an already-open pgx transaction, so
-// the outbox INSERT rides the same commit/rollback as the domain
-// INSERT. forwarder.NewPublisher wraps it in an envelope tagged with
-// the destination topic, and cqrs.NewEventBusWithConfig adds
-// type-based name routing via cqrs.JSONMarshaler + cqrs.StructName.
-//
-// See watermill-cookbook.md Recipe 1 (per-tx construction) and
-// Recipe 6 (AutoInitializeSchema vs InitializeSchema split) for the
-// reasoning behind this exact shape.
+// newTxEventBus がこのデモの肝だ。[sql.TxFromPgx] で Watermill publisher を
+// 既に開いた pgx transaction に紐付け、[forwarder] で envelope にラップし、
+// [Watermill CQRS docs] の cqrs.NewEventBusWithConfig で型ベースのルーティングを加える。
+// outbox INSERT はドメイン INSERT と同じ commit/rollback に乗る。
 // ======================================================================
 
 const (
-	outboxTopic = "outbox" // watermill-sql "topic" → physical watermill_outbox table
-	eventsTopic = "events" // NATS subject + projection subscribe topic
+	outboxTopic = "outbox" // watermill-sql の "topic" → 実テーブル watermill_outbox
+	eventsTopic = "events" // NATS subject かつ projection の subscribe topic
 )
 
 type app struct {
@@ -198,15 +182,13 @@ func (a *app) newTxEventBus(tx pgx.Tx) (*cqrs.EventBus, error) {
 }
 
 // ======================================================================
-// 4. The write path — four steps inside one transaction
+// 4. 書き込みパス — 1 つの transaction の中の 4 ステップ
 //
 //	Begin → { Load → Execute → AppendToStream → Publish } → Commit → Apply
 //
-// The four bracketed steps run inside the tx. If any of them fails,
-// the deferred Rollback undoes everything (including the outbox
-// INSERT), so there is no "event persisted but not published" state.
-// Apply runs after Commit to advance the in-memory aggregate state
-// only when the durable write actually landed.
+// {} 内のどこかで失敗すれば deferred rollback がすべてを巻き戻す。
+// outbox INSERT も一緒に消えるため「保存済み・未配信」状態にならない。
+// Apply は Commit 後に呼ぶ — 永続化が確定してからインメモリ状態を進める。
 // ======================================================================
 
 func (a *app) incrementCounter(ctx context.Context, id string, delta int64) (int64, error) {
@@ -227,9 +209,7 @@ func (a *app) incrementCounter(ctx context.Context, id string, delta int64) (int
 		return 0, err
 	}
 
-	// bus only needs the open tx; building it after appendToStream
-	// keeps the happy path linear and saves an unused chain on the
-	// error path.
+	// appendToStream の後に構築することで正常系を上から下に読めるようにする。
 	bus, err := a.newTxEventBus(tx)
 	if err != nil {
 		return 0, err
@@ -284,16 +264,13 @@ func (a *app) appendToStream(ctx context.Context, tx pgx.Tx, streamID string, e 
 }
 
 // ======================================================================
-// 5. The forwarder daemon — drain watermill_outbox into NATS
+// 5. forwarder daemon — watermill_outbox を NATS へ drain する
 //
-// BeginnerFromPgx, not TxFromPgx: the drainer opens its own short
-// transactions per poll, it does not ride any existing one.
+// BeginnerFromPgx を使う（TxFromPgx ではない）。drainer はポーリングごとに
+// 自分で短い transaction を開くため、既存の tx に乗る必要がない。
 //
-// InitializeSchema: true creates watermill_outbox and
-// watermill_offsets_outbox on first run — the one place schema
-// auto-init must be on. Section 1's schemaDDL deliberately does not
-// declare the watermill tables; watermill owns their exact shape.
-// See cookbook Recipe 2 for the full drainer mechanics.
+// InitializeSchema: true はここだけ有効にする。watermill_outbox と
+// watermill_offsets_outbox の DDL は watermill に管理させる。
 // ======================================================================
 
 func (a *app) runForwarder(ctx context.Context, downstream message.Publisher) error {
@@ -326,10 +303,9 @@ func (a *app) runForwarder(ctx context.Context, downstream message.Publisher) er
 // ======================================================================
 // 6. NATS JetStream stream bootstrap
 //
-// watermill-nats does not create streams for you. If you skip this
-// step, both the publisher and the subscriber will silently fail to
-// find the stream and your pipeline will appear to run while no
-// messages move. Always CreateOrUpdateStream at startup, idempotent.
+// watermill-nats は stream を自動作成しない。このステップを省くと
+// publisher も subscriber も黙って失敗し、パイプラインが止まる。
+// CreateOrUpdateStream は idempotent なので起動時に必ず呼ぶ。
 // ======================================================================
 
 func ensureStream(ctx context.Context, nc *natsgo.Conn, topic string) error {
@@ -345,16 +321,14 @@ func ensureStream(ctx context.Context, nc *natsgo.Conn, topic string) error {
 }
 
 // ======================================================================
-// 7. The projection loop — NATS → counter_view UPSERT
+// 7. projection ループ — NATS → counter_view UPSERT
 //
-// cqrs.NewGroupEventHandler takes a typed func(ctx, *T) error and
-// dispatches by the message's "name" metadata, which the write side
-// (section 3) sets via cqrs.StructName. Same marshaler rule on both
-// sides means no shared registry.
+// cqrs.NewGroupEventHandler は型付き func(ctx, *T) error を受け取り、
+// メッセージの "name" メタデータでディスパッチする。section 3 の marshaler と
+// 同じ cqrs.StructName を使うため、別途 registry は不要だ。
 //
-// onIncremented's SQL is a monotonic UPSERT: the WHERE clause makes
-// duplicate or out-of-order deliveries silent no-ops, so no separate
-// dedup/inbox table is needed.
+// onIncremented の UPSERT は WHERE で stream_version の単調増加を条件にする。
+// 重複・順序逆転の配信は idempotent に無視される。
 // ======================================================================
 
 func (a *app) runProjection(ctx context.Context, nc *natsgo.Conn) error {
@@ -410,14 +384,9 @@ func (a *app) onIncremented(ctx context.Context, e *Incremented) error {
 // POST /counters/:id/increment  body: {"delta": N}
 // GET  /counters/:id[?after=N]
 //
-// Echo lets each handler return an error or call c.JSON in one
-// statement, so all the response-write boilerplate (Content-Type,
-// WriteHeader, fmt.Fprintf) goes away. echo.NewHTTPError carries the
-// status code and message in a single value.
-//
-// ?after=N is a read-your-writes ticket: the GET blocks until
-// counter_view.last_event_seq reaches at least N, up to a 5-second
-// budget. readCounterView handles the polling.
+// ?after=N を指定すると、counter_view.last_event_seq が N 以上になるまで
+// GET がブロックする（最大 5 秒）。自分が書いたバージョンが読めることを保証する
+// read-your-writes 動作。
 // ======================================================================
 
 var errReadTimeout = errors.New("read-your-writes timeout")
@@ -471,11 +440,9 @@ func (a *app) showHandler(c echo.Context) error {
 	}
 }
 
-// readCounterView is the read-your-writes poll used by showHandler
-// (still part of section 8). With after > 0 it polls counter_view
-// until last_event_seq reaches at least after or readBudget expires,
-// returning errReadTimeout in the latter case. With after == 0 it
-// returns immediately, with pgx.ErrNoRows if the counter has no row.
+// readCounterView は showHandler が使う read-your-writes poll（section 8）。
+// after > 0 のとき、last_event_seq が after 以上になるか readBudget が切れるまで
+// counter_view をポーリングする。after == 0 のときは即時に返す。
 func (a *app) readCounterView(ctx context.Context, id string, after int64) (value, version int64, err error) {
 	const (
 		pollInterval = 25 * time.Millisecond
@@ -497,8 +464,8 @@ func (a *app) readCounterView(ctx context.Context, id string, after int64) (valu
 	deadline := time.Now().Add(readBudget)
 	for {
 		v, ver, qerr := query()
-		// pgx.ErrNoRows here means the projection hasn't created the
-		// row yet; treat it as version 0 and keep polling.
+		// pgx.ErrNoRows は projection がまだ行を作っていない状態を意味する。
+		// version 0 として扱い、ポーリングを続ける。
 		if qerr != nil && !errors.Is(qerr, pgx.ErrNoRows) {
 			return 0, 0, qerr
 		}
@@ -517,8 +484,7 @@ func (a *app) readCounterView(ctx context.Context, id string, after int64) (valu
 }
 
 // ======================================================================
-// main — wire dependencies into app, start the daemons and HTTP
-// server, wait for shutdown
+// main — 依存を app に組み込み、daemon と HTTP server を起動してシャットダウンを待つ
 // ======================================================================
 
 func main() {

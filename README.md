@@ -1,14 +1,12 @@
 # watermill-practice
 
-Single-file Go demo of the [Transactional Outbox pattern][outbox] with
-Watermill, PostgreSQL, and NATS JetStream. The whole pipeline —
-aggregate → event store → outbox → forwarder → broker → projection →
-read model → HTTP — lives in `main.go` (~590 lines, eight numbered
-sections). `watermill-cookbook.md` next to it is six prose recipes
-explaining the gotchas the Watermill docs gloss over. Read the
-cookbook for the *why*.
+Watermill と PostgreSQL、NATS JetStream で組んだ [Transactional Outbox パターン][outbox] の
+単一ファイル Go デモ。aggregate → event store → outbox → forwarder → broker →
+projection → read model → HTTP のパイプライン全体が `main.go` に収まっていて
+（約 590 行、8 セクション）、隣にある `watermill-cookbook.md` がその裏側にある罠と
+判断を 6 本のレシピで解説している。
 
-## Run
+## 実行
 
 ```
 docker compose up -d   # postgres :5432 + nats :4222
@@ -26,21 +24,17 @@ $ curl 'localhost:8080/counters/c1?after=2'
 {"counter_id":"c1","value":8,"version":2}
 ```
 
-`?after=N` is a [read-your-writes ticket][ryw]: the GET blocks until
-the projection catches up to version N (5-second budget).
+`?after=N` を付けると projection がバージョン N に追いつくまで GET がブロックする
+（タイムアウト 5 秒）。自分の POST で作ったバージョンを確実に読み返せる
+[read-your-writes][ryw] の仕組み。
 
-## Stack
+## このリポジトリの位置づけ
 
-Go 1.25 · Watermill v1.5 (sql/v4 + nats/v2 + cqrs + forwarder) ·
-pgx/v5 · Echo v4 · PostgreSQL 16 · NATS 2.10 with JetStream.
-
-## What this is and isn't
-
-A teaching artifact, not a starter template. It shows one correct
-shape of the outbox pattern with Watermill and the traps around it.
-Deliberately omitted: schema evolution / upcasters, sagas, dead-letter
-queues, multi-aggregate transactions, production observability. The
-cookbook's closing section lists the same.
+スターターテンプレートというより、outbox パターンの形と罠を読み解くための教材。
+Watermill で書くとどう短くなるか、どこで詰まりやすいかを実例で示すことに集中していて、
+次の話題は意図的に外した: schema evolution / upcaster、saga、dead-letter queue、
+multi-aggregate トランザクション、プロダクション向け observability。同じリストは
+cookbook の末尾にもある。
 
 [outbox]: https://microservices.io/patterns/data/transactional-outbox.html
 [ryw]: https://www.allthingsdistributed.com/2008/12/eventually_consistent.html
