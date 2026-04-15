@@ -1,8 +1,9 @@
 # Watermill event-sourcing cookbook
 
 Six recipes for using Watermill as the transport layer of an
-event-sourced PostgreSQL + NATS JetStream stack. Each recipe is
-demonstrated **runnable** in the single file next to this one,
+event-sourced PostgreSQL + NATS JetStream stack, following the
+[Transactional Outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html).
+Each recipe is demonstrated **runnable** in the single file next to this one,
 [`main.go`](./main.go). The two files are all you need: drop them into
 any project, adjust the domain types, and the pipeline works.
 
@@ -35,8 +36,9 @@ event-sourced system.
 ### Solution
 
 Bind Watermill's SQL publisher to an already-open pgx transaction using
-`sql.TxFromPgx(tx)`, then wrap it with `forwarder.NewPublisher` and
-`cqrs.NewEventBusWithConfig`:
+[`sql.TxFromPgx(tx)`](https://pkg.go.dev/github.com/ThreeDotsLabs/watermill-sql/v4/pkg/sql#TxFromPgx),
+then wrap it with [`forwarder.NewPublisher`](https://pkg.go.dev/github.com/ThreeDotsLabs/watermill/components/forwarder)
+and `cqrs.NewEventBusWithConfig`:
 
 ```go
 sqlPub, _ := wsql.NewPublisher(
@@ -60,24 +62,29 @@ Now `bus.Publish(ctx, event)` INSERTs into `watermill_outbox` through the
 SAME transaction as your domain INSERT. One commit makes both visible;
 one rollback removes both.
 
-- `TxFromPgx(tx)` is the critical piece — it's what "joins" the
-  watermill publisher to your transaction.
+- `TxFromPgx(tx)` is the critical piece — it's what "joins" the watermill publisher to your transaction.
 - `forwarder.NewPublisher` wraps the raw SQL publisher with an envelope
   that tags the destination topic (`"events"`) so the drainer
   (Recipe 2) knows where to republish each row later.
 - `cqrs.NewEventBusWithConfig` is optional in theory — you could call
   `fwdPub.Publish("events", msg)` directly — but in practice it's worth
   the two extra config lines because it gives you type-based event
-  name routing (Recipe 5) for free.
+  name routing (Recipe 5) for free. See the [watermill forwarder docs](https://watermill.io/docs/forwarder/)
+  and [real-world example](https://github.com/ThreeDotsLabs/watermill/tree/master/_examples/real-world-examples/transactional-events-forwarder)
+  for the full picture.
 
 ### Gotcha: `AutoInitializeSchema` MUST be false
 
 The default is false, which is correct. Do not set it to true on the
-publisher side. Watermill's schema initialiser issues `CREATE TABLE`,
-and DDL inside an open transaction triggers an implicit commit in
-PostgreSQL. Your carefully atomic two-row write quietly fragments into
-"domain row before implicit commit, outbox row after". The outbox row
-then lives in a different tx than the one you rolled back on failure.
+publisher side: [`sql.NewPublisher`](https://pkg.go.dev/github.com/ThreeDotsLabs/watermill-sql/v4/pkg/sql#PublisherConfig)
+returns an error if `AutoInitializeSchema: true` is combined with
+`TxFromPgx` — schema bootstrap belongs in migrations, not inside a
+domain transaction. (On database engines where DDL implicitly commits,
+such as MySQL, the schema `CREATE TABLE` would also silently fragment
+the atomic write; PostgreSQL does not have this problem — it has
+[transactional DDL](https://wiki.postgresql.org/wiki/Transactional_DDL_in_PostgreSQL:_A_Competitive_Analysis)
+— but watermill-sql forbids the combination unconditionally because the
+framework supports both engines.)
 
 ### Gotcha: build the publisher chain per transaction
 
@@ -102,8 +109,8 @@ republishes to the downstream publisher.
 ### Solution
 
 `forwarder.NewForwarder` plus a subscriber that reads from the outbox
-table. Use `sql.BeginnerFromPgx(pool)` — NOT `TxFromPgx` — because the
-drainer opens its own short transactions per poll:
+table. Use [`sql.BeginnerFromPgx(pool)`](https://pkg.go.dev/github.com/ThreeDotsLabs/watermill-sql/v4/pkg/sql#BeginnerFromPgx)
+— NOT `TxFromPgx` — because the drainer opens its own short transactions per poll:
 
 ```go
 sub, _ := wsql.NewSubscriber(
@@ -135,8 +142,10 @@ Recipe 1 does not apply.
 
 ### Gotcha: Beginner vs Tx
 
-`BeginnerFromPgx` gives watermill a "can begin transactions" handle;
-`TxFromPgx` gives watermill "an already-begun transaction to use".
+[`sql.BeginnerFromPgx`](https://pkg.go.dev/github.com/ThreeDotsLabs/watermill-sql/v4/pkg/sql#BeginnerFromPgx)
+gives watermill a "can begin transactions" handle;
+[`sql.TxFromPgx`](https://pkg.go.dev/github.com/ThreeDotsLabs/watermill-sql/v4/pkg/sql#TxFromPgx)
+gives watermill "an already-begun transaction to use".
 Subscribers want the former, publishers embedded in a domain
 transaction want the latter. Mixing them up gives you a silently
 broken drainer.
@@ -171,15 +180,16 @@ _, err := js.CreateOrUpdateStream(ctx, natsjs.StreamConfig{
 
 Do this BEFORE constructing any watermill publisher or subscriber that
 targets the stream. `CreateOrUpdate` is safe to call on every process
-start — it creates if missing and leaves alone if present.
+start (see [jetstream.StreamManager](https://pkg.go.dev/github.com/nats-io/nats.go/jetstream#StreamManager)) — it creates if missing and leaves alone if present.
 
 ### Why this isn't automatic
 
-JetStream streams have non-trivial configuration (retention, storage
-type, replica count, max age, subject list). Watermill deliberately
-does not guess; the framework author pushes the choice back to your
-startup code. The trade-off is clarity at the cost of one forgotten
-line biting every first-time user.
+[JetStream streams](https://docs.nats.io/nats-concepts/jetstream/streams)
+have non-trivial configuration (retention, storage type, replica count,
+max age, subject list). Watermill deliberately does not guess; the
+framework author pushes the choice back to your startup code. The
+trade-off is clarity at the cost of one forgotten line biting every
+first-time user.
 
 ---
 
@@ -193,8 +203,9 @@ type, without writing your own message router.
 
 ### Solution
 
-`cqrs.NewEventGroupProcessorWithConfig` wires a subscriber, a marshaler,
-and a group of typed handlers onto a watermill router:
+[`cqrs.EventGroupProcessor`](https://pkg.go.dev/github.com/ThreeDotsLabs/watermill/components/cqrs#EventGroupProcessor)
+wires a subscriber, a marshaler, and a group of typed handlers onto a
+watermill router (see the [watermill CQRS docs](https://watermill.io/docs/cqrs/)):
 
 ```go
 router, _ := message.NewRouter(message.RouterConfig{}, logger)
@@ -248,12 +259,14 @@ a string registry that gets out of sync with your Go types.
 
 ### Solution
 
-`cqrs.JSONMarshaler.GenerateName` is the single-point-of-truth function
-that turns a Go struct into a routing string. Two built-ins ship:
+[`cqrs.JSONMarshaler.GenerateName`](https://pkg.go.dev/github.com/ThreeDotsLabs/watermill/components/cqrs#JSONMarshaler)
+is the single-point-of-truth function that turns a Go struct into a
+routing string. Two built-ins ship:
 
 - `cqrs.FullyQualifiedStructName` — returns `"counter.Incremented"`
   (package-qualified).
-- `cqrs.StructName` — returns `"Incremented"` (trims package prefix).
+- [`cqrs.StructName`](https://pkg.go.dev/github.com/ThreeDotsLabs/watermill/components/cqrs#StructName)
+  — returns `"Incremented"` (trims package prefix).
 
 Pick one, use it on BOTH sides. `cqrs.StructName` is rename-stable
 across package moves (at the cost of cross-package name collisions,
@@ -296,15 +309,16 @@ symmetrical. They are not. Using them wrong is silent and painful.
 
 |                         | Publisher                                 | Subscriber                                         |
 | ----------------------- | ----------------------------------------- | -------------------------------------------------- |
-| Config field            | `PublisherConfig.AutoInitializeSchema`    | `SubscriberConfig.InitializeSchema`                |
+| Config field            | [`PublisherConfig.AutoInitializeSchema`](https://pkg.go.dev/github.com/ThreeDotsLabs/watermill-sql/v4/pkg/sql#PublisherConfig)    | [`SubscriberConfig.InitializeSchema`](https://pkg.go.dev/github.com/ThreeDotsLabs/watermill-sql/v4/pkg/sql#SubscriberConfig)                |
 | Required value          | **false**                                 | **true** (first run only, idempotent after)        |
-| Why                     | Publisher runs inside your domain tx. DDL triggers implicit commit. Boom. | Subscriber runs outside any domain tx. DDL runs cleanly. |
+| Why                     | `NewPublisher` returns an error if this is true with `TxFromPgx`. Schema bootstrap belongs in migrations. (On MySQL, DDL would also silently commit the open tx; PostgreSQL has [transactional DDL](https://wiki.postgresql.org/wiki/Transactional_DDL_in_PostgreSQL:_A_Competitive_Analysis) and avoids that, but watermill-sql forbids the combination on all engines.) | Subscriber runs outside any domain tx. DDL runs cleanly. |
 
 Every other combination is wrong in some subtle way:
 
-- **Publisher true**: your domain transaction silently commits when
-  watermill issues `CREATE TABLE watermill_outbox`. Half your events
-  land outside the tx you thought you wrote them in.
+- **Publisher true**: `NewPublisher` returns an error immediately —
+  watermill-sql refuses this combination with `TxFromPgx`. You will
+  not get a working publisher; every transaction that tries to build
+  the publisher chain errors out at the `NewPublisher` call.
 - **Subscriber false**: watermill never creates `watermill_outbox`.
   The drainer attaches to a non-existent table and fails to poll.
   Depending on your retry logic, this can manifest as "the forwarder

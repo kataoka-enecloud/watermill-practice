@@ -1,6 +1,6 @@
 // Command watermill-practice is a self-contained demonstration of the
-// event-sourced watermill outbox pattern: aggregate → event store →
-// outbox → forwarder → NATS → projection → read model → HTTP.
+// [Transactional Outbox pattern] applied with Watermill: aggregate →
+// event store → outbox → forwarder → NATS → projection → read model → HTTP.
 //
 // Run:
 //
@@ -18,27 +18,35 @@
 //	curl 'localhost:8080/counters/c1?after=2'
 //	# → {"counter_id":"c1","value":8,"version":2}
 //
-// The ?after=N parameter is a read-your-writes ticket: the GET blocks
-// until counter_view.last_event_seq reaches at least N, so a client
-// that just saw version 2 from a POST can ask the projection to catch
-// up before replying (up to a 5-second budget).
+// The ?after=N parameter is a read-your-writes ticket (see [Werner Vogels
+// on read-your-writes]): the GET blocks until counter_view.last_event_seq
+// reaches at least N, so a client that just saw version 2 from a POST can
+// ask the projection to catch up before replying (up to a 5-second budget).
 //
-// The eight sections of this file, each copyable in isolation:
+// The eight numbered sections of this file:
 //
 //  1. Event store + read model DDL.
-//  2. Minimal event-sourced aggregate.
-//  3. newTxEventBus — the three-layer publisher chain
-//     (sql.TxFromPgx → forwarder.NewPublisher → cqrs.NewEventBusWithConfig).
-//  4. incrementCounter — one pgx transaction: load, execute, append,
-//     publish, commit.
-//  5. runForwarder — outbox drainer, BeginnerFromPgx + InitializeSchema.
+//  2. Counter aggregate.
+//  3. app struct + (*app).newTxEventBus — the three-layer publisher
+//     chain ([sql.TxFromPgx] → [forwarder] → [Watermill CQRS docs]).
+//  4. (*app).incrementCounter — one pgx transaction: load, execute,
+//     appendToStream, publish, commit.
+//  5. (*app).runForwarder — outbox drainer, BeginnerFromPgx +
+//     InitializeSchema.
 //  6. ensureStream — manual JetStream stream bootstrap (watermill-nats
 //     does not create streams for you).
-//  7. runProjection — cqrs.EventGroupProcessor + typed handlers.
-//  8. HTTP handlers — incrementHTTP + showHTTP + read-your-writes poll.
+//  7. (*app).runProjection — cqrs.EventGroupProcessor + onIncremented.
+//  8. (*app).incrementHandler / showHandler — Echo handlers and the
+//     read-your-writes poll.
 //
 // See watermill-cookbook.md next to this file for prose commentary on
 // each recipe and the gotchas each one protects against.
+//
+// [Transactional Outbox pattern]: https://microservices.io/patterns/data/transactional-outbox.html
+// [Werner Vogels on read-your-writes]: https://www.allthingsdistributed.com/2008/12/eventually_consistent.html
+// [sql.TxFromPgx]: https://pkg.go.dev/github.com/ThreeDotsLabs/watermill-sql/v4/pkg/sql#TxFromPgx
+// [forwarder]: https://pkg.go.dev/github.com/ThreeDotsLabs/watermill/components/forwarder
+// [Watermill CQRS docs]: https://watermill.io/docs/cqrs/
 package main
 
 import (
@@ -69,6 +77,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/labstack/echo/v4"
 	natsgo "github.com/nats-io/nats.go"
 	jetsdk "github.com/nats-io/nats.go/jetstream"
 )
@@ -100,13 +109,19 @@ CREATE TABLE IF NOT EXISTS counter_view (
 `
 
 // ======================================================================
-// 2. Minimal event-sourced aggregate
+// 2. Counter aggregate
 //
-// Counter has no replay helper because the write path does an ad-hoc
-// replay in loadCounter below. The goal is to show watermill's moving
-// parts, not DDD. Incremented carries its StreamVersion so the event
-// store and the projection share one authoritative sequence number.
+// Counter is the aggregate, Incremented is its only event. Increment is
+// the command (returns an event), Apply folds an event into state.
+// time.Now / uuid.New are called inline — this is a demo, not a place
+// to hide a Clock port behind an interface.
 // ======================================================================
+
+type Counter struct {
+	id      string
+	value   int64
+	version int64
+}
 
 type Incremented struct {
 	EventID       uuid.UUID `json:"event_id"`
@@ -114,12 +129,6 @@ type Incremented struct {
 	Delta         int64     `json:"delta"`
 	StreamVersion int64     `json:"stream_version"`
 	OccurredAt    time.Time `json:"occurred_at"`
-}
-
-type Counter struct {
-	id      string
-	value   int64
-	version int64
 }
 
 func (c *Counter) Apply(e *Incremented) {
@@ -138,22 +147,19 @@ func (c *Counter) Increment(delta int64) *Incremented {
 }
 
 // ======================================================================
-// 3. The three-layer outbox publisher chain — the core recipe
+// 3. app struct + the three-layer outbox publisher chain
 //
-// sql.NewPublisher(sql.TxFromPgx(tx)) binds the watermill publisher to
-// an already-open pgx transaction, so the outbox INSERT rides the same
-// commit/rollback as your domain INSERT. That's the atomicity guarantee
-// outbox exists for.
+// app holds the per-process dependencies that every domain method,
+// every projection handler, and every HTTP handler needs. Hanging
+// methods off this struct keeps signatures short and stops the
+// dependencies from leaking across requests.
 //
-// forwarder.NewPublisher wraps the SQL publisher and serialises the
-// destination topic ("events" in our case) into a JSON envelope that
-// the drainer (section 5) uses to decide where to republish each
-// message. Without it, the drainer would not know the NATS subject.
-//
-// cqrs.NewEventBusWithConfig adds type-based name routing via
-// cqrs.JSONMarshaler + cqrs.StructName. Downstream projection handlers
-// dispatch by the same rule, so write side and read side agree on
-// event names without a shared registry.
+// newTxEventBus is the core recipe. sql.NewPublisher(sql.TxFromPgx(tx))
+// binds the watermill publisher to an already-open pgx transaction, so
+// the outbox INSERT rides the same commit/rollback as the domain
+// INSERT. forwarder.NewPublisher wraps it in an envelope tagged with
+// the destination topic, and cqrs.NewEventBusWithConfig adds
+// type-based name routing via cqrs.JSONMarshaler + cqrs.StructName.
 //
 // See watermill-cookbook.md Recipe 1 (per-tx construction) and
 // Recipe 6 (AutoInitializeSchema vs InitializeSchema split) for the
@@ -165,11 +171,16 @@ const (
 	eventsTopic = "events" // NATS subject + projection subscribe topic
 )
 
-func newTxEventBus(tx pgx.Tx, logger watermill.LoggerAdapter) (*cqrs.EventBus, error) {
+type app struct {
+	pool   *pgxpool.Pool
+	logger watermill.LoggerAdapter
+}
+
+func (a *app) newTxEventBus(tx pgx.Tx) (*cqrs.EventBus, error) {
 	sqlPub, err := wsql.NewPublisher(
 		wsql.TxFromPgx(tx),
 		wsql.PublisherConfig{SchemaAdapter: wsql.DefaultPostgreSQLSchema{}},
-		logger,
+		a.logger,
 	)
 	if err != nil {
 		return nil, err
@@ -182,14 +193,14 @@ func newTxEventBus(tx pgx.Tx, logger watermill.LoggerAdapter) (*cqrs.EventBus, e
 			return eventsTopic, nil
 		},
 		Marshaler: cqrs.JSONMarshaler{GenerateName: cqrs.StructName},
-		Logger:    logger,
+		Logger:    a.logger,
 	})
 }
 
 // ======================================================================
 // 4. The write path — four steps inside one transaction
 //
-//	Begin → { Load → Execute → Append → Publish } → Commit → Apply
+//	Begin → { Load → Execute → AppendToStream → Publish } → Commit → Apply
 //
 // The four bracketed steps run inside the tx. If any of them fails,
 // the deferred Rollback undoes everything (including the outbox
@@ -198,27 +209,28 @@ func newTxEventBus(tx pgx.Tx, logger watermill.LoggerAdapter) (*cqrs.EventBus, e
 // only when the durable write actually landed.
 // ======================================================================
 
-func incrementCounter(ctx context.Context, pool *pgxpool.Pool, id string, delta int64, logger watermill.LoggerAdapter) (int64, error) {
-	tx, err := pool.Begin(ctx)
+func (a *app) incrementCounter(ctx context.Context, id string, delta int64) (int64, error) {
+	tx, err := a.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	c, err := loadCounter(ctx, tx, id)
+	c, err := a.loadCounter(ctx, tx, id)
 	if err != nil {
 		return 0, err
 	}
 
 	e := c.Increment(delta)
 
-	if err := appendEvent(ctx, tx, id, e); err != nil {
+	if err := a.appendToStream(ctx, tx, id, e); err != nil {
 		return 0, err
 	}
 
-	// bus only needs the open tx; building it after Append keeps the
-	// happy path linear and saves an unused chain on the error path.
-	bus, err := newTxEventBus(tx, logger)
+	// bus only needs the open tx; building it after appendToStream
+	// keeps the happy path linear and saves an unused chain on the
+	// error path.
+	bus, err := a.newTxEventBus(tx)
 	if err != nil {
 		return 0, err
 	}
@@ -233,7 +245,7 @@ func incrementCounter(ctx context.Context, pool *pgxpool.Pool, id string, delta 
 	return c.version, nil
 }
 
-func loadCounter(ctx context.Context, tx pgx.Tx, id string) (*Counter, error) {
+func (a *app) loadCounter(ctx context.Context, tx pgx.Tx, id string) (*Counter, error) {
 	rows, err := tx.Query(ctx, `
 		SELECT event_data
 		FROM events
@@ -259,7 +271,7 @@ func loadCounter(ctx context.Context, tx pgx.Tx, id string) (*Counter, error) {
 	return c, rows.Err()
 }
 
-func appendEvent(ctx context.Context, tx pgx.Tx, streamID string, e *Incremented) error {
+func (a *app) appendToStream(ctx context.Context, tx pgx.Tx, streamID string, e *Incremented) error {
 	data, err := json.Marshal(e)
 	if err != nil {
 		return err
@@ -284,22 +296,22 @@ func appendEvent(ctx context.Context, tx pgx.Tx, streamID string, e *Incremented
 // See cookbook Recipe 2 for the full drainer mechanics.
 // ======================================================================
 
-func runForwarder(ctx context.Context, pool *pgxpool.Pool, downstream message.Publisher, logger watermill.LoggerAdapter) error {
+func (a *app) runForwarder(ctx context.Context, downstream message.Publisher) error {
 	sub, err := wsql.NewSubscriber(
-		wsql.BeginnerFromPgx(pool),
+		wsql.BeginnerFromPgx(a.pool),
 		wsql.SubscriberConfig{
 			SchemaAdapter:    wsql.DefaultPostgreSQLSchema{},
 			OffsetsAdapter:   wsql.DefaultPostgreSQLOffsetsAdapter{},
 			InitializeSchema: true,
 		},
-		logger,
+		a.logger,
 	)
 	if err != nil {
 		return err
 	}
 	defer sub.Close()
 
-	fwd, err := forwarder.NewForwarder(sub, downstream, logger, forwarder.Config{
+	fwd, err := forwarder.NewForwarder(sub, downstream, a.logger, forwarder.Config{
 		ForwarderTopic: outboxTopic,
 	})
 	if err != nil {
@@ -340,13 +352,13 @@ func ensureStream(ctx context.Context, nc *natsgo.Conn, topic string) error {
 // (section 3) sets via cqrs.StructName. Same marshaler rule on both
 // sides means no shared registry.
 //
-// The projection SQL is a monotonic UPSERT: the WHERE clause makes
+// onIncremented's SQL is a monotonic UPSERT: the WHERE clause makes
 // duplicate or out-of-order deliveries silent no-ops, so no separate
 // dedup/inbox table is needed.
 // ======================================================================
 
-func runProjection(ctx context.Context, nc *natsgo.Conn, pool *pgxpool.Pool, logger watermill.LoggerAdapter) error {
-	router, err := message.NewRouter(message.RouterConfig{}, logger)
+func (a *app) runProjection(ctx context.Context, nc *natsgo.Conn) error {
+	router, err := message.NewRouter(message.RouterConfig{}, a.logger)
 	if err != nil {
 		return err
 	}
@@ -358,28 +370,18 @@ func runProjection(ctx context.Context, nc *natsgo.Conn, pool *pgxpool.Pool, log
 		SubscriberConstructor: func(_ cqrs.EventGroupProcessorSubscriberConstructorParams) (message.Subscriber, error) {
 			return wmjs.NewSubscriber(wmjs.SubscriberConfig{
 				Conn:   nc,
-				Logger: logger,
+				Logger: a.logger,
 			})
 		},
 		Marshaler: cqrs.JSONMarshaler{GenerateName: cqrs.StructName},
-		Logger:    logger,
+		Logger:    a.logger,
 	})
 	if err != nil {
 		return err
 	}
 
 	if err := eventProc.AddHandlersGroup("counter_view",
-		cqrs.NewGroupEventHandler(func(ctx context.Context, e *Incremented) error {
-			_, err := pool.Exec(ctx, `
-				INSERT INTO counter_view (counter_id, value, last_event_seq)
-				VALUES ($1, $2, $3)
-				ON CONFLICT (counter_id) DO UPDATE
-				SET value          = counter_view.value + EXCLUDED.value,
-				    last_event_seq = EXCLUDED.last_event_seq
-				WHERE counter_view.last_event_seq < EXCLUDED.last_event_seq`,
-				e.CounterID, e.Delta, e.StreamVersion)
-			return err
-		}),
+		cqrs.NewGroupEventHandler(a.onIncremented),
 	); err != nil {
 		return err
 	}
@@ -387,79 +389,94 @@ func runProjection(ctx context.Context, nc *natsgo.Conn, pool *pgxpool.Pool, log
 	return router.Run(ctx)
 }
 
+func (a *app) onIncremented(ctx context.Context, e *Incremented) error {
+	_, err := a.pool.Exec(ctx, `
+		INSERT INTO counter_view (counter_id, value, last_event_seq)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (counter_id) DO UPDATE
+		SET value          = counter_view.value + EXCLUDED.value,
+		    last_event_seq = EXCLUDED.last_event_seq
+		WHERE counter_view.last_event_seq < EXCLUDED.last_event_seq`,
+		e.CounterID, e.Delta, e.StreamVersion)
+	if err != nil {
+		return fmt.Errorf("upsert counter view: %w", err)
+	}
+	return nil
+}
+
 // ======================================================================
-// 8. HTTP handlers — the smallest surface for driving the pipeline
+// 8. HTTP handlers — Echo
 //
-// POST /counters/{id}/increment  body: {"delta": N}
-// GET  /counters/{id}[?after=N]
+// POST /counters/:id/increment  body: {"delta": N}
+// GET  /counters/:id[?after=N]
 //
-// The GET endpoint accepts ?after=N, a read-your-writes ticket the
-// client receives from a previous POST. When set, the handler polls
-// counter_view.last_event_seq until it reaches at least N, up to a
-// 5-second budget.
+// Echo lets each handler return an error or call c.JSON in one
+// statement, so all the response-write boilerplate (Content-Type,
+// WriteHeader, fmt.Fprintf) goes away. echo.NewHTTPError carries the
+// status code and message in a single value.
+//
+// ?after=N is a read-your-writes ticket: the GET blocks until
+// counter_view.last_event_seq reaches at least N, up to a 5-second
+// budget. readCounterView handles the polling.
 // ======================================================================
 
 var errReadTimeout = errors.New("read-your-writes timeout")
 
-func incrementHTTP(pool *pgxpool.Pool, logger watermill.LoggerAdapter) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Delta int64 `json:"delta"`
+func (a *app) incrementHandler(c echo.Context) error {
+	var body struct {
+		Delta int64 `json:"delta"`
+	}
+	if err := c.Bind(&body); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+	if body.Delta <= 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "delta must be positive")
+	}
+	id := c.Param("id")
+	version, err := a.incrementCounter(c.Request().Context(), id, body.Delta)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusAccepted, echo.Map{
+		"counter_id": id,
+		"version":    version,
+	})
+}
+
+func (a *app) showHandler(c echo.Context) error {
+	id := c.Param("id")
+	var after int64
+	if s := c.QueryParam("after"); s != "" {
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil || n < 0 {
+			return echo.NewHTTPError(http.StatusBadRequest, "after must be a non-negative integer")
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if body.Delta <= 0 {
-			http.Error(w, "delta must be positive", http.StatusBadRequest)
-			return
-		}
-		id := r.PathValue("id")
-		version, err := incrementCounter(r.Context(), pool, id, body.Delta, logger)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusAccepted)
-		_, _ = fmt.Fprintf(w, `{"counter_id":%q,"version":%d}`, id, version)
+		after = n
+	}
+
+	value, version, err := a.readCounterView(c.Request().Context(), id, after)
+	switch {
+	case err == nil:
+		return c.JSON(http.StatusOK, echo.Map{
+			"counter_id": id,
+			"value":      value,
+			"version":    version,
+		})
+	case errors.Is(err, errReadTimeout):
+		return echo.NewHTTPError(http.StatusRequestTimeout, "read-your-writes timeout")
+	case errors.Is(err, pgx.ErrNoRows):
+		return echo.NewHTTPError(http.StatusNotFound, "not found")
+	default:
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 }
 
-func showHTTP(pool *pgxpool.Pool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		id := r.PathValue("id")
-		var after int64
-		if s := r.URL.Query().Get("after"); s != "" {
-			n, err := strconv.ParseInt(s, 10, 64)
-			if err != nil || n < 0 {
-				http.Error(w, "after must be a non-negative integer", http.StatusBadRequest)
-				return
-			}
-			after = n
-		}
-
-		value, version, err := readCounterView(r.Context(), pool, id, after)
-		switch {
-		case err == nil:
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = fmt.Fprintf(w, `{"counter_id":%q,"value":%d,"version":%d}`, id, value, version)
-		case errors.Is(err, errReadTimeout):
-			http.Error(w, "read-your-writes timeout", http.StatusRequestTimeout)
-		case errors.Is(err, pgx.ErrNoRows):
-			http.Error(w, "not found", http.StatusNotFound)
-		default:
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-	}
-}
-
-// readCounterView is the read-your-writes poll used by showHTTP
+// readCounterView is the read-your-writes poll used by showHandler
 // (still part of section 8). With after > 0 it polls counter_view
 // until last_event_seq reaches at least after or readBudget expires,
 // returning errReadTimeout in the latter case. With after == 0 it
 // returns immediately, with pgx.ErrNoRows if the counter has no row.
-func readCounterView(ctx context.Context, pool *pgxpool.Pool, id string, after int64) (value, version int64, err error) {
+func (a *app) readCounterView(ctx context.Context, id string, after int64) (value, version int64, err error) {
 	const (
 		pollInterval = 25 * time.Millisecond
 		readBudget   = 5 * time.Second
@@ -467,7 +484,7 @@ func readCounterView(ctx context.Context, pool *pgxpool.Pool, id string, after i
 
 	query := func() (int64, int64, error) {
 		var v, ver int64
-		e := pool.QueryRow(ctx,
+		e := a.pool.QueryRow(ctx,
 			`SELECT value, last_event_seq FROM counter_view WHERE counter_id = $1`, id,
 		).Scan(&v, &ver)
 		return v, ver, e
@@ -500,8 +517,8 @@ func readCounterView(ctx context.Context, pool *pgxpool.Pool, id string, after i
 }
 
 // ======================================================================
-// main — wire everything, start the forwarder, projection, and HTTP
-// server, then wait for shutdown
+// main — wire dependencies into app, start the daemons and HTTP
+// server, wait for shutdown
 // ======================================================================
 
 func main() {
@@ -530,25 +547,31 @@ func main() {
 	must(err)
 	defer natsPub.Close()
 
+	a := &app{
+		pool:   pool,
+		logger: logger,
+	}
+
 	go func() {
-		if err := runForwarder(ctx, pool, natsPub, logger); err != nil && !errors.Is(err, context.Canceled) {
+		if err := a.runForwarder(ctx, natsPub); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("forwarder: %v", err)
 		}
 	}()
 	go func() {
-		if err := runProjection(ctx, nc, pool, logger); err != nil && !errors.Is(err, context.Canceled) {
+		if err := a.runProjection(ctx, nc); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("projection: %v", err)
 		}
 	}()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /counters/{id}/increment", incrementHTTP(pool, logger))
-	mux.HandleFunc("GET /counters/{id}", showHTTP(pool))
+	e := echo.New()
+	e.HideBanner = true
+	e.HidePort = true
+	e.POST("/counters/:id/increment", a.incrementHandler)
+	e.GET("/counters/:id", a.showHandler)
 
-	srv := &http.Server{Addr: ":8080", Handler: mux}
 	go func() {
 		log.Println("listening on :8080")
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := e.Start(":8080"); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("http: %v", err)
 		}
 	}()
@@ -557,7 +580,7 @@ func main() {
 	log.Println("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(shutdownCtx)
+	_ = e.Shutdown(shutdownCtx)
 }
 
 func must(err error) {
